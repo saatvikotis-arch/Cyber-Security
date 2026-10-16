@@ -32,19 +32,34 @@ class Ledger:
         return voter_id.strip().lower() in self.voter_registry
 
     def has_voted(self, proposal_id: str, voter_id: str) -> bool:
+        vid = voter_id.strip().lower()
+        pid = proposal_id.strip()
         for block in self.chain:
             for ballot in block.ballots:
-                if ballot.proposal_id == proposal_id and ballot.voter_id == voter_id:
+                if ballot.proposal_id.strip() == pid and ballot.voter_id.strip().lower() == vid:
                     return True
         return False
 
     def tally(self, proposal_id: str) -> Dict[str, int]:
         results: Dict[str, int] = {}
+        seen_voters = set()
+        pid = proposal_id.strip()
         for block in self.chain:
             for ballot in block.ballots:
-                if ballot.proposal_id == proposal_id:
-                    results[ballot.choice] = results.get(ballot.choice, 0) + ballot.weight
+                if ballot.proposal_id.strip() == pid:
+                    vid = ballot.voter_id.strip().lower()
+                    if vid not in seen_voters:
+                        seen_voters.add(vid)
+                        results[ballot.choice] = results.get(ballot.choice, 0) + ballot.weight
         return results
+
+    def get_proposals(self) -> List[str]:
+        proposals = set()
+        for block in self.chain:
+            for ballot in block.ballots:
+                if ballot.proposal_id:
+                    proposals.add(ballot.proposal_id.strip())
+        return sorted(proposals)
 
     @property
     def latest_block(self) -> Block:

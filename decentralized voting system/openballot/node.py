@@ -89,35 +89,64 @@ class NodeHandler(BaseHTTPRequestHandler):
 
         if data is None:
             return self._send_json({"error": "Invalid JSON payload"}, 400)
+        if not isinstance(data, dict):
+            return self._send_json({"error": "JSON payload must be an object"}, 400)
 
         if path == "/api/v1/ballots":
-            ballot = Ballot.from_dict(data)
+            try:
+                ballot = Ballot.from_dict(data)
+            except (AttributeError, TypeError, ValueError):
+                return self._send_json({"error": "Invalid ballot format"}, 400)
 
             if not ballot.voter_id or not ballot.proposal_id or not ballot.choice:
                 return self._send_json({"error": "Missing required ballot fields"}, 400)
+
+            # Enforce democratic standard weight = 1
+            if ballot.weight != 1:
+                return self._send_json({"error": "Invalid vote weight: standard elections require weight=1"}, 400)
 
             # 1. Verify digital signature
             if not ballot.verify():
                 return self._send_json({"error": "Cryptographic signature verification failed"}, 401)
 
             # 2. Verify voter registration (case-insensitive whitelist)
-            if not self.node.ledger.is_registered(ballot.voter_id.lower()):
+            if not self.node.ledger.is_registered(ballot.voter_id):
                 return self._send_json({"error": "Voter ID not in authorized voter registry"}, 403)
 
             # 3. Check if voter already cast ballot on confirmed ledger
             if self.node.ledger.has_voted(ballot.proposal_id, ballot.voter_id):
                 return self._send_json({"error": "Voter has already cast a ballot for this proposal"}, 409)
 
+            # 4. Check if voter already has a ballot pending in mempool
+            if self.node.mempool.has_ballot(ballot.proposal_id, ballot.voter_id):
+                return self._send_json({"error": "A ballot for this voter is already pending in the mempool"}, 409)
+
             # Ingest ballot into mempool
-            self.node.mempool.add(ballot)
+            if not self.node.mempool.add(ballot):
+                return self._send_json({"error": "Duplicate ballot in mempool"}, 409)
+
             return self._send_json({"status": "accepted", "proposal": ballot.proposal_id}, 202)
 
         elif path == "/api/v1/mine":
             pending = self.node.mempool.drain()
+            valid_ballots = []
+            seen_in_block = set()
+            for b in pending:
+                vote_key = (b.proposal_id.strip(), b.voter_id.strip().lower())
+                if (
+                    b.verify()
+                    and b.weight == 1
+                    and self.node.ledger.is_registered(b.voter_id)
+                    and not self.node.ledger.has_voted(b.proposal_id, b.voter_id)
+                    and vote_key not in seen_in_block
+                ):
+                    valid_ballots.append(b)
+                    seen_in_block.add(vote_key)
+
             new_block = Block(
                 index=len(self.node.ledger.chain),
                 prev_hash=self.node.ledger.chain[-1].hash,
-                ballots=pending
+                ballots=valid_ballots
             )
             new_block.mine(difficulty=self.node.difficulty)
             self.node.ledger.chain.append(new_block)
@@ -125,7 +154,7 @@ class NodeHandler(BaseHTTPRequestHandler):
                 "status": "mined",
                 "block_index": new_block.index,
                 "block_hash": new_block.hash,
-                "ballots_sealed": len(pending)
+                "ballots_sealed": len(valid_ballots)
             })
 
         elif path == "/api/v1/peers":

@@ -13,6 +13,7 @@ from openballot.crypto import (
     sign_message
 )
 from openballot.ballot import Ballot
+from openballot.block import Block
 from openballot.ledger import Ledger
 from openballot.node import NodeServer, NodeHandler
 
@@ -104,6 +105,88 @@ def cmd_status(args):
     print(json.dumps(res, indent=2))
 
 
+def cmd_verify(args):
+    """
+    Cryptographically audits the entire blockchain downloaded from a node:
+    verifies genesis block, block hash continuity, proof-of-work difficulty,
+    Ed25519 ballot digital signatures, and double-voting detection.
+    """
+    endpoint = f"{args.node.rstrip('/')}/api/v1/chain"
+    res = _get_json(endpoint)
+    if "error" in res:
+        print(f"Error connecting to node: {res['error']}", file=sys.stderr)
+        sys.exit(1)
+
+    chain_data = res.get("chain", [])
+    if not chain_data:
+        print("[!] Blockchain is empty.", file=sys.stderr)
+        sys.exit(1)
+
+    try:
+        blocks = [Block.from_dict(b) for b in chain_data]
+    except Exception as e:
+        print(f"[✗] Corrupted block data format: {e}", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"[*] Auditing blockchain ({len(blocks)} blocks) from {args.node}...\n")
+    all_valid = True
+    seen_votes = set()
+
+    for idx, block in enumerate(blocks):
+        block_ok = True
+        reasons = []
+
+        # 1. Genesis check
+        if idx == 0:
+            if block.index != 0 or block.prev_hash != "0" * 64:
+                block_ok = False
+                reasons.append("Invalid genesis block structure")
+        else:
+            prev_block = blocks[idx - 1]
+            if block.index != prev_block.index + 1:
+                block_ok = False
+                reasons.append(f"Index mismatch: expected {prev_block.index + 1}, got {block.index}")
+            if block.prev_hash != prev_block.hash:
+                block_ok = False
+                reasons.append("Hash pointer mismatch with previous block")
+
+        # 2. Block hash & PoW difficulty
+        if block.compute_hash() != block.hash:
+            block_ok = False
+            reasons.append("Block hash mismatch with content payload")
+        if idx > 0:
+            target = "0" * args.difficulty
+            if not block.hash.startswith(target):
+                block_ok = False
+                reasons.append(f"Proof-of-work target ('{target}') not satisfied")
+
+        # 3. Ballot signatures and deduplication
+        for b in block.ballots:
+            if not b.verify():
+                block_ok = False
+                reasons.append(f"Invalid Ed25519 signature from voter {b.voter_id[:8]}...")
+            vote_key = (b.proposal_id.strip(), b.voter_id.strip().lower())
+            if vote_key in seen_votes:
+                block_ok = False
+                reasons.append(f"Double voting detected: {b.voter_id[:8]}... on {b.proposal_id}")
+            seen_votes.add(vote_key)
+
+        status_symbol = "[✓]" if block_ok else "[✗]"
+        print(f"{status_symbol} Block #{block.index:<3} | Hash: {block.hash[:16]}... | Ballots: {len(block.ballots)}")
+        if not block_ok:
+            all_valid = False
+            for r in reasons:
+                print(f"    └── Error: {r}")
+
+    print("\n" + "=" * 50)
+    if all_valid:
+        print("RESULT: Blockchain Cryptographic Audit PASSED (Ledger is Authentic)")
+        return True
+    else:
+        print("RESULT: Blockchain Cryptographic Audit FAILED (Ledger Integrity Compromised)")
+        return False
+
+
 def cmd_serve(args):
     ledger = Ledger()
     ledger.create_genesis_block()
@@ -150,6 +233,12 @@ def main():
     p_status.add_argument("--node", default="http://127.0.0.1:8000", help="Node URL")
     p_status.set_defaults(func=cmd_status)
 
+    # verify
+    p_verify = subparsers.add_parser("verify", help="Cryptographically audit the blockchain ledger")
+    p_verify.add_argument("--node", default="http://127.0.0.1:8000", help="Node URL")
+    p_verify.add_argument("--difficulty", type=int, default=1, help="Expected PoW difficulty")
+    p_verify.set_defaults(func=cmd_verify)
+
     # serve
     p_serve = subparsers.add_parser("serve", help="Run node HTTP daemon")
     p_serve.add_argument("--port", type=int, default=8000, help="Listen port")
@@ -157,7 +246,9 @@ def main():
     p_serve.set_defaults(func=cmd_serve)
 
     parsed_args = parser.parse_args()
-    parsed_args.func(parsed_args)
+    ret = parsed_args.func(parsed_args)
+    if isinstance(ret, bool) and not ret:
+        sys.exit(1)
 
 
 if __name__ == "__main__":
